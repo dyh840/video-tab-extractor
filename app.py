@@ -1,15 +1,23 @@
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+import ctypes
+import os
 import re
 import shutil
 import subprocess
+import sys
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from staff import find_staff
+
+
+FROZEN = getattr(sys, "frozen", False)
+APP_DIR = Path(sys.executable if FROZEN else __file__).resolve().parent
+BUNDLED_FONT = APP_DIR / "fonts" / "NotoSansSC.ttf"
 
 
 @dataclass
@@ -23,6 +31,9 @@ class Cut:
 
 
 def find_ffmpeg():
+    bundled = APP_DIR / "ffmpeg" / "ffmpeg.exe"
+    if bundled.is_file():
+        return bundled
     path = shutil.which("ffmpeg")
     if path:
         return Path(path)
@@ -31,11 +42,19 @@ def find_ffmpeg():
 
 
 def ffmpeg_run(exe, args):
-    return subprocess.run(
-        [str(exe), "-nostdin", "-hide_banner", *map(str, args)],
-        capture_output=True, timeout=15,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    set_dll_directory = ctypes.windll.kernel32.SetDllDirectoryW if FROZEN and sys.platform == "win32" else None
+    if set_dll_directory is not None:
+        # PyInstaller's DLL directory would otherwise be inherited by FFmpeg.
+        set_dll_directory(None)
+    try:
+        return subprocess.run(
+            [str(exe), "-nostdin", "-hide_banner", *map(str, args)],
+            capture_output=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    finally:
+        if set_dll_directory is not None:
+            set_dll_directory(sys._MEIPASS)
 
 
 def video_duration(exe, path):
@@ -99,9 +118,17 @@ def group_cuts(cuts):
 def write_pdf(path, title, rows):
     if not rows:
         raise ValueError("请先加入谱面。")
-    regular = Path("C:/Windows/Fonts/msyh.ttc")
+    windows_fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+    regular = next((candidate for candidate in (
+        BUNDLED_FONT, windows_fonts / "msyh.ttc", windows_fonts / "segoeui.ttf",
+    ) if candidate.is_file()), None)
+    if regular is None:
+        raise OSError("找不到用于导出 PDF 的字体。")
     font = ImageFont.truetype(str(regular), 27)
     heading = ImageFont.truetype(str(regular), 47)
+    if regular == BUNDLED_FONT:
+        font.set_variation_by_name("Regular")
+        heading.set_variation_by_name("Medium")
     size = (1654, 2339)
     pages = []
     number = 1
@@ -167,6 +194,7 @@ class App:
         ttk.Button(bar, text="打开视频", command=self.open_video).pack(side="left")
         ttk.Button(bar, text="预览谱面", command=self.preview).pack(side="left", padx=6)
         ttk.Button(bar, text="导出 PDF", command=self.export).pack(side="left")
+        ttk.Label(bar, text="页首标题沿用原视频文件名").pack(side="left", padx=(8, 0))
         self.file_label = ttk.Label(bar, text="请选择含谱面的视频", width=60)
         self.file_label.pack(side="left", padx=14)
 
@@ -291,7 +319,7 @@ class App:
         canvas.delete("all")
         if self.frame is None:
             canvas.create_text(canvas.winfo_width() / 2, canvas.winfo_height() / 2,
-                               text="打开一个含六线谱画面的视频", fill="#f4f8fa", font=("Microsoft YaHei UI", 15))
+                               text="打开一个含六线谱画面的视频", fill="#f4f8fa", font="TkHeadingFont")
             return
         w, h = self.frame.size
         scale = min(max(1, canvas.winfo_width()) / w, max(1, canvas.winfo_height()) / h)
@@ -425,7 +453,7 @@ class App:
         if not self.cuts:
             self.status.configure(text="先框选并加入谱面，再导出 PDF。")
             return
-        path = filedialog.asksaveasfilename(parent=self.root, title="导出 PDF", defaultextension=".pdf",
+        path = filedialog.asksaveasfilename(parent=self.root, title="导出 PDF（页首标题沿用原视频文件名）", defaultextension=".pdf",
                                             initialfile=self.path.stem + " 吉他谱.pdf", filetypes=[("PDF", "*.pdf")])
         if not path:
             return
@@ -442,7 +470,60 @@ class App:
         messagebox.showerror(title, str(error), parent=self.root)
 
 
-if __name__ == "__main__":
+def new_window():
+    registered = sys.platform == "win32" and BUNDLED_FONT.is_file() and (
+        ctypes.windll.gdi32.AddFontResourceExW(str(BUNDLED_FONT), 0x10, None)
+    )
     root = tk.Tk()
-    App(root)
-    root.mainloop()
+    if registered:
+        for name in ("TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont"):
+            tkfont.nametofont(name, root=root).configure(family="Noto Sans SC")
+    return root
+
+
+def self_test(video, output):
+    root = new_window()
+    try:
+        root.withdraw()
+        app = App(root)
+        if app.ffmpeg is None or (FROZEN and app.ffmpeg != APP_DIR / "ffmpeg" / "ffmpeg.exe"):
+            raise RuntimeError("Bundled FFmpeg was not found.")
+        if FROZEN and not BUNDLED_FONT.is_file():
+            raise RuntimeError("Bundled font was not found.")
+        duration = video_duration(app.ffmpeg, video)
+        for start, second_half in ((0, False), (duration / 2, True)):
+            frame = video_frame(app.ffmpeg, video, start)
+            app.show_frame(frame, start)
+            middle = frame.width // 2
+            app.box = (middle if second_half else 0, 0, frame.width if second_half else middle, frame.height)
+            if not find_staff(frame.crop(app.box)):
+                raise ValueError("Fixture must show a staff in the left half, then in the right half.")
+            app.add(2)
+        rows = group_cuts(app.cuts)
+        if len(rows) != 1 or rows[0][0] != 4:
+            raise RuntimeError("Expected one row of four measures.")
+        row = rows[0][1]
+        split = app.cuts[0].image.width
+        left = find_staff(row.crop((0, 0, split, row.height)))
+        right = find_staff(row.crop((split, 0, row.width, row.height)))
+        if not left or not right or any(abs(a - b) > 2 for a, b in zip(left, right)):
+            raise RuntimeError("The two staves did not align.")
+        write_pdf(output, "便携版自检", rows)
+        with Path(output).open("rb") as stream:
+            if stream.read(5) != b"%PDF-":
+                raise RuntimeError("The export is not a PDF.")
+    finally:
+        root.destroy()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--self-test":
+        try:
+            self_test(*sys.argv[2:])
+        except Exception as error:
+            Path(sys.argv[3] + ".error.txt").write_text(str(error), encoding="utf-8")
+            raise SystemExit(1)
+    else:
+        root = new_window()
+        App(root)
+        root.mainloop()
